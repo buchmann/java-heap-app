@@ -1,0 +1,231 @@
+package com.example.javaheapapp;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import javax.annotation.PostConstruct;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+@SpringBootApplication
+public class MainApp {
+    public static void main(String[] args) {
+        SpringApplication.run(MainApp.class, args);
+    }
+}
+
+@RestController
+class LoadController {
+    private final List<DataBlock> heapLoad = new ArrayList<>();
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(3);
+    private int targetPercentage = 10; // Default target heap usage percentage set to 10%
+    private int gcLoadPercentage = 0; // Default garbage collection load percentage
+    private int normalWorkloadPercentage = 0; // Default normal workload percentage
+    private long blockSize = 10 * 1024 * 1024; // Define block size as 10MB, now mutable
+    private final MemoryMXBean memoryMXBean = ManagementFactory.getMemoryMXBean(); // Use MemoryMXBean for heap stats
+    private final Random random = new Random();
+    private boolean allocationComplete = false; // Flag to prevent reallocation once target is met
+    private long totalDeallocated = 0; // Track total deallocated memory in bytes
+
+    @PostConstruct
+    public void startHeapAdjustment() {
+        // Wait for 60 seconds before starting to allow setup and monitoring tools to connect
+        scheduler.schedule(this::startMemoryAdjustmentTask, 60, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::createGarbage, 60, 1, TimeUnit.SECONDS); // Start garbage creation after delay
+        scheduler.scheduleAtFixedRate(this::executeNormalWorkload, 60, 1, TimeUnit.SECONDS); // Start normal workload after delay
+    }
+
+    private void startMemoryAdjustmentTask() {
+        // Schedule a task to adjust heap usage every 5 seconds
+        scheduler.scheduleAtFixedRate(this::adjustHeapUsage, 0, 5, TimeUnit.SECONDS);
+    }
+
+    @GetMapping("/setHeapUsage")
+    public String setHeapUsage(@RequestParam(value = "percentage", defaultValue = "10") int targetPercentage) {
+        if (targetPercentage < 1 || targetPercentage > 90) {
+            return "Percentage must be between 1 and 90.";
+        }
+        this.targetPercentage = targetPercentage;
+        allocationComplete = false; // Reset allocation state when target is updated
+        adjustHeapUsage(); // Immediately adjust to the new percentage if needed
+        return String.format("Target heap usage set to %d%%.", targetPercentage);
+    }
+
+    @GetMapping("/setGcLoad")
+    public String setGcLoad(@RequestParam(value = "percentage", defaultValue = "0") int gcLoadPercentage) {
+        if (gcLoadPercentage < 0 || gcLoadPercentage > 100) {
+            return "GC load percentage must be between 0 and 100.";
+        }
+        this.gcLoadPercentage = gcLoadPercentage;
+        return String.format("Garbage collection load set to %d%%.", gcLoadPercentage);
+    }
+
+    @GetMapping("/setNormalWorkload")
+    public String setNormalWorkload(@RequestParam(value = "percentage", defaultValue = "0") int normalWorkloadPercentage) {
+        if (normalWorkloadPercentage < 0 || normalWorkloadPercentage > 100) {
+            return "Normal workload percentage must be between 0 and 100.";
+        }
+        this.normalWorkloadPercentage = normalWorkloadPercentage;
+        return String.format("Normal workload set to %d%%.", normalWorkloadPercentage);
+    }
+
+    @GetMapping("/status")
+    public String status() {
+        MemoryUsage heapMemoryUsage = memoryMXBean.getHeapMemoryUsage();
+        long usedMemory = heapMemoryUsage.getUsed();
+        long maxMemory = heapMemoryUsage.getMax();
+        long delta = (maxMemory * targetPercentage / 100) - usedMemory;
+
+        long usedMemoryInMB = usedMemory / (1024 * 1024);
+        long maxMemoryInMB = maxMemory / (1024 * 1024);
+        long deltaInMB = delta / (1024 * 1024);
+        long totalDeallocatedInMB = totalDeallocated / (1024 * 1024);
+
+        return String.format(
+                "Heap memory usage: %dMB used, %dMB max, Delta to target: %dMB, Total deallocated: %dMB, GC Load: %d%%, Normal Workload: %d%%",
+                usedMemoryInMB, maxMemoryInMB, deltaInMB, totalDeallocatedInMB, gcLoadPercentage, normalWorkloadPercentage);
+    }
+
+    @GetMapping("/releaseMemory")
+    public String releaseMemory(@RequestParam(value = "megabytes", defaultValue = "10") int megabytes) {
+        long bytesToFree = megabytes * 1024L * 1024L;
+
+        if (megabytes <= 0) {
+            return "Amount to release must be greater than 0.";
+        }
+
+        deallocateMemory(bytesToFree);
+        allocationComplete = false; // Allow reallocation if necessary after manual release
+        System.gc(); // Suggest garbage collection after releasing memory
+        return String.format("Attempted to release %dMB of memory. Current list size: %d entries.", megabytes, heapLoad.size());
+    }
+
+    private void adjustHeapUsage() {
+        MemoryUsage heapMemoryUsage = memoryMXBean.getHeapMemoryUsage();
+
+        long maxHeap = heapMemoryUsage.getMax(); // Maximum heap memory in bytes
+        long targetUsage = maxHeap * targetPercentage / 100; // Target usage in bytes
+        long currentUsed = heapMemoryUsage.getUsed(); // Current actual usage in bytes
+
+        long delta = targetUsage - currentUsed;
+
+        System.out.println(String.format("Adjusting memory. Target: %dMB, Current: %dMB, Delta: %dMB",
+                targetUsage / (1024 * 1024), currentUsed / (1024 * 1024), delta / (1024 * 1024)));
+
+        if (delta > 0 && !allocationComplete) {
+            allocateMemoryAdaptive(delta);
+        } else if (delta < 0) {
+            deallocateMemory(-delta);
+            allocationComplete = true;
+            System.gc(); // Suggest garbage collection after releasing memory
+            System.out.println("Deallocated excess memory. Target usage achieved.");
+        } else {
+            allocationComplete = true;
+            System.out.println("No additional allocation needed. Heap is near the target usage.");
+        }
+    }
+
+    private void allocateMemoryAdaptive(long bytesToAllocate) {
+        MemoryUsage heapMemoryUsage = memoryMXBean.getHeapMemoryUsage();
+        long targetUsage = heapMemoryUsage.getMax() * targetPercentage / 100; // Recalculate target usage in bytes
+
+        while (bytesToAllocate > 0) {
+            long currentUsed = memoryMXBean.getHeapMemoryUsage().getUsed();
+            if (currentUsed >= targetUsage) {
+                System.out.println("Target usage reached. Stopping further allocation.");
+                allocationComplete = true;
+                break;
+            }
+
+            // Calculate the size of the next block to allocate, adapting based on available memory
+            int currentBlockSize = (int) Math.min(bytesToAllocate, blockSize);
+            try {
+                DataBlock dataBlock = new DataBlock(currentBlockSize / Long.BYTES);
+                heapLoad.add(dataBlock);
+                bytesToAllocate -= currentBlockSize;
+
+                System.out.println(String.format("Allocated block. Current list size: %d entries, Used Memory: %dMB",
+                        heapLoad.size(), currentUsed / (1024 * 1024)));
+            } catch (OutOfMemoryError e) {
+                System.out.println("Out of memory during allocation. Reducing allocation block size.");
+                // Reduce allocation size to prevent further OutOfMemoryErrors
+                blockSize /= 2;
+                if (blockSize < 1 * 1024 * 1024) {
+                    blockSize = 1 * 1024 * 1024; // Set a minimum block size of 1MB
+                }
+            }
+
+            // Stop allocating if free memory is low to prevent OOM
+            if (Runtime.getRuntime().freeMemory() < blockSize) {
+                System.out.println("Stopped allocation to avoid running out of memory.");
+                break;
+            }
+        }
+    }
+
+    private void deallocateMemory(long bytesToFree) {
+        long toRemove = bytesToFree / blockSize; // Calculate how many blocks to remove
+        long deallocated = 0;
+
+        while (toRemove > 0 && !heapLoad.isEmpty()) {
+            heapLoad.remove(heapLoad.size() - 1); // Remove elements from the list to deallocate memory
+            toRemove--;
+            deallocated += blockSize;
+        }
+
+        totalDeallocated += deallocated;
+
+        System.out.println(String.format("Deallocated memory. Total deallocated this time: %dMB, Current list size: %d entries",
+                deallocated / (1024 * 1024), heapLoad.size()));
+    }
+
+    private void createGarbage() {
+        if (gcLoadPercentage > 0) {
+            int iterations = gcLoadPercentage * 10; // More iterations for higher GC load
+            List<Object> garbage = new ArrayList<>();
+            for (int i = 0; i < iterations; i++) {
+                // Create short-lived objects to add GC load
+                garbage.add(new Object());
+            }
+            // Clear the list to make the objects eligible for GC
+            garbage.clear();
+            System.out.println(String.format("Created garbage objects to simulate GC load. Load: %d%%", gcLoadPercentage));
+        }
+    }
+
+    private void executeNormalWorkload() {
+        if (normalWorkloadPercentage > 0) {
+            int iterations = normalWorkloadPercentage * 1000; // More iterations for higher normal workload
+            for (int i = 0; i < iterations; i++) {
+                double dummy = Math.pow(random.nextDouble(), 2);
+                dummy += Math.sin(dummy);
+            }
+            System.out.println(String.format("Executed normal workload with intensity: %d%%", normalWorkloadPercentage));
+        }
+    }
+
+    // Helper class to create data blocks
+    static class DataBlock {
+        private final long[] data;
+
+        public DataBlock(int size) {
+            // Create an array of longs to occupy the specified amount of memory
+            this.data = new long[size];
+            for (int i = 0; i < size; i++) {
+                // Fill the array with some random values
+                this.data[i] = (long) (Math.random() * Long.MAX_VALUE);
+            }
+        }
+    }
+}
+

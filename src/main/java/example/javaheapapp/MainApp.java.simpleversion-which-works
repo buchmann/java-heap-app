@@ -1,0 +1,37 @@
+package com.example.javaheapapp;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@SpringBootApplication
+public class MainApp {
+    public static void main(String[] args) {
+        SpringApplication.run(MainApp.class, args);
+    }
+}
+
+@RestController
+class LoadController {
+    private final List<byte[]> heapLoad = new ArrayList<>();
+
+    @GetMapping("/load")
+    public String increaseHeap(@RequestParam(value = "size", defaultValue = "10") int sizeInMb) {
+        byte[] bytes = new byte[sizeInMb * 1024 * 1024];
+        heapLoad.add(bytes);
+        return "Heap increased by " + sizeInMb + "MB, current load size: " + heapLoad.size() * sizeInMb + "MB";
+    }
+
+    @GetMapping("/status")
+    public String status() {
+        int totalHeapSize = heapLoad.size() * 10;
+        return "Heap currently holding: " + totalHeapSize + "MB";
+    }
+}
+
+
